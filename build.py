@@ -42,6 +42,7 @@ TUR_LABELS   = {
     'KKTC': 'KKTC Kontenjanlı',
     'MAP': 'MAP (Gülhane)',
     'MSB': 'MSB (Kuvvet Komutanlıkları)',
+    'SBA': 'SBÜ Bağlı Üniversite',
     'BNDH': 'Burhan Nalbantoğlu D.H.',
     'ADL': 'Adli Tıp Kurumu',
     'İçişleri Bakanlığı': 'İçişleri Bakanlığı',
@@ -192,7 +193,7 @@ def parse_2025_line(line):
     2025 format after stripping 9-digit code:
       SINIF TÜR İL [KURUM…] UZMANLIK PUAN_TÜR GENEL YBU [FOOTNOTES]
     For T/MAP the KURUM text appears *after* the quota due to PDF column order.
-    Skip T/ÜNİ (university hospitals) and T/YBU (foreign-national slots).
+    Skips only T/İçişleri (garbled text in PDF).
     """
     m = CODE_RE.match(line)
     if not m:
@@ -212,9 +213,6 @@ def parse_2025_line(line):
         return None
 
     tur = pparts[1]
-    # Skip university / foreign-national records
-    if tur in ('ÜNİ', 'YBU'):
-        return None
 
     spec, pos = find_specialty(rest)
     if spec is None:
