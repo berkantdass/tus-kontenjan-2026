@@ -178,6 +178,17 @@ def parse_2026_line(line):
 
     il       = pparts[rest_start]
     kf       = ' '.join(pparts[rest_start + 1:])
+
+    # Some S EAH rows in the 2026 PDF have the city name repeated between the
+    # hospital name and the university-affiliation columns (PDF column bleed).
+    # e.g. "...Şehir Hastanesi İstanbul Medeniyet Üniversitesi..."
+    # Only strip when the city name is followed by ANOTHER word before
+    # 'Üniversitesi' (so "Hastanesi Adıyaman Üniversitesi" is NOT touched —
+    # 'Adıyaman' IS the university name there).
+    if sinif == 'S' and tur == 'EAH' and il:
+        kf = re.sub(r'(Hastanesi)\s+' + re.escape(il) + r'\s+(?=\S+\s+Üniversitesi)',
+                    r'\1 ', kf, flags=re.I)
+
     hkey     = extract_hospital_key(sinif, tur, kf)
     k        = extract_hospital_short(kf, tur)
     ckey     = make_key(sinif, tur, il, hkey, spec)
@@ -288,6 +299,24 @@ def parse_2025_line(line):
         extracted = extract_s_hospital_from_suffix(sparts)
         if extracted:
             kf = extracted
+
+    # For T ÜNİ/YBU/SBA, sometimes the university name ends up in the suffix
+    # instead of the prefix (PDF column bleed at page boundaries).
+    # e.g. prefix='T ÜNİ İSTANBUL', suffix='K 6 -- Fakültesi İstanbul Üniversitesi-Cerrahpaşa...'
+    # Detect empty kf and try to recover from suffix tail.
+    if tur in ('ÜNİ', 'YBU', 'SBA') and not kf:
+        tail_tokens = sparts[3:]
+        tail = ' '.join(tail_tokens)
+        # Skip leading footnote numbers and Tıp/Fakültesi fragments
+        tail_clean = re.sub(r'^[\d,\s\*]+', '', tail).strip()
+        tail_clean = re.sub(r'^(?:Tıp\s+)?Fakültesi\s+', '', tail_clean, flags=re.I).strip()
+        # Find the university name (word before 'Üniversitesi')
+        m_uni = re.search(r'(\S+\s+Üniversitesi\S*(?:\s+\S+)*)', tail_clean, re.I)
+        if m_uni:
+            uni_name = m_uni.group(1).strip()
+            # Strip any trailing 'Tıp' fragment (suffix cut at page boundary)
+            uni_name = re.sub(r'\s+Tıp\s*$', '', uni_name, flags=re.I).strip()
+            kf = uni_name + ' Tıp Fakültesi'
 
     hkey = extract_hospital_key(sinif, tur, kf)
     k    = extract_hospital_short(kf, tur) if kf else ''
