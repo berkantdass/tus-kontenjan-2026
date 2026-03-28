@@ -62,33 +62,38 @@ def find_specialty(line):
 
 
 def extract_hospital_key(sinif, tur, kurum_full):
-    """Normalised hospital name used as comparison key."""
+    """Normalised name used as comparison key.
+
+    For T ÜNİ / YBU / SBA: university name is reliably in the prefix of both
+    PDFs → use it for hospital-level matching.
+    For S type: the 2025 PDF prints the hospital name AFTER the quota columns
+    (different column order), so it is garbled/incomplete → city-level only.
+    """
     s = kurum_full.strip()
-    if sinif == 'S':
-        s = re.sub(r'^T\.C\.\s+Sağlık\s+Bakanlığı\s+', '', s, flags=re.I)
-        # Cut off university portion
-        for marker in ['Sağlık Bilimleri Üniversitesi', 'Ankara Yıldırım']:
-            p = s.find(marker)
-            if p > 2:
-                s = s[:p]
-                break
-        m = re.search(r'\s+\S+\s+Üniversitesi', s)
-        if m and m.start() > 3:
-            s = s[:m.start()]
-        return s.strip().upper()
-    # For non-S types we skip hospital in key (fewer hospitals, simpler matching)
-    return ''
+    if tur in ('ÜNİ', 'YBU', 'SBA'):
+        # Strip trailing "Tıp Fakültesi" for a stable key
+        s = re.sub(r'\s+Tıp\s+Fakültesi\s*$', '', s, flags=re.I).strip()
+        return s.upper()
+    return ''   # city-level fallback for S EAH and other types
 
 
 def make_key(sinif, tur, il, hospital_key, uzmanlik):
-    # City-level matching gives best coverage given 2025 PDF structure.
-    # Hospital-level matching fails for ~30% of records due to PDF column-order
-    # issues in 2025 (specialty text extracted before hospital name on some pages).
-    return f"{sinif}|{tur}|{il.upper()}|{uzmanlik}"
+    # T SBA is a new 2026 category for institutions that were T ÜNİ in 2025.
+    # Normalize to ÜNİ so they match across years.
+    tur_key = 'ÜNİ' if tur == 'SBA' else tur
+    if hospital_key:
+        # Hospital-level key: university name is globally unique, city not needed.
+        return f"{sinif}|{tur_key}|{hospital_key}|{uzmanlik}"
+    # City-level fallback (S EAH, MAP, MSB, etc.)
+    return f"{sinif}|{tur_key}|{il.upper()}|{uzmanlik}"
 
 
-def extract_hospital_short(kurum_full):
+def extract_hospital_short(kurum_full, tur=''):
     """Human-readable short label."""
+    if tur in ('ÜNİ', 'YBU', 'SBA'):
+        # For university hospitals just strip "Tıp Fakültesi" suffix
+        s = re.sub(r'\s+Tıp\s+Fakültesi\s*$', '', kurum_full.strip(), flags=re.I)
+        return s.strip() or kurum_full
     s = re.sub(r'^T\.C\.\s+Sağlık\s+Bakanlığı\s+', '', kurum_full, flags=re.I)
     for marker in ['Sağlık Bilimleri Üniversitesi', 'Ankara Yıldırım']:
         p = s.find(marker)
@@ -139,7 +144,7 @@ def parse_2026_line(line):
     il       = pparts[rest_start]
     kf       = ' '.join(pparts[rest_start + 1:])
     hkey     = extract_hospital_key(sinif, tur, kf)
-    k        = extract_hospital_short(kf)
+    k        = extract_hospital_short(kf, tur)
     ckey     = make_key(sinif, tur, il, hkey, spec)
 
     return dict(s=sinif, t=tur, i=il, k=k, kf=kf, u=spec, n=n, d=dipnot,
@@ -247,7 +252,7 @@ def parse_2025_line(line):
         kf  = ' '.join(pprts[3:])
 
     hkey = extract_hospital_key(sinif, tur, kf)
-    k    = extract_hospital_short(kf) if kf else ''
+    k    = extract_hospital_short(kf, tur) if kf else ''
     ckey = make_key(sinif, tur, il, hkey, spec)
 
     return dict(s=sinif, t=tur, i=il.title(), k=k, kf=kf, u=spec,
@@ -266,14 +271,31 @@ def parse_2025(path):
 # ── Comparison ───────────────────────────────────────────────────────────────
 
 def enrich_with_comparison(records_26, records_25):
-    """Add p (previous quota) field to each 2026 record."""
-    lookup = {}
+    """Add p (previous quota) field to each 2026 record.
+
+    Only assigns p when the match is unambiguous: exactly one 2025 record and
+    exactly one 2026 record share the same key.  City-level keys (S EAH) can
+    match many-to-many, which would produce incorrect fan-out values.
+    """
+    lookup_n   = {}   # key → summed 2025 quota
+    lookup_cnt = {}   # key → number of 2025 records with that key
     for r in records_25:
         k = r['ckey']
-        lookup[k] = lookup.get(k, 0) + r['n']
+        lookup_n[k]   = lookup_n.get(k, 0) + r['n']
+        lookup_cnt[k] = lookup_cnt.get(k, 0) + 1
+
+    cnt_26 = {}       # key → number of 2026 records with that key
+    for r in records_26:
+        cnt_26[r['ckey']] = cnt_26.get(r['ckey'], 0) + 1
 
     for r in records_26:
-        r['p'] = lookup.get(r['ckey'])   # None = new in 2026/1
+        k = r['ckey']
+        if k not in lookup_n:
+            r['p'] = None   # new in 2026/1
+        elif cnt_26[k] == 1 and lookup_cnt.get(k, 0) == 1:
+            r['p'] = lookup_n[k]   # unambiguous 1-to-1 match
+        else:
+            r['p'] = None   # ambiguous city-level fan-out — don't show wrong data
 
 
 # ── HTML generator ───────────────────────────────────────────────────────────
