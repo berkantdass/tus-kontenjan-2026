@@ -61,20 +61,50 @@ def find_specialty(line):
     return None, -1
 
 
+_HOSP_FROM_SUFFIX = re.compile(
+    r'((?:\S+\s+)*?Hastanesi)\s+T\.C\.\s+Sağlık\s+Bakanlığı\s+(.+)', re.I)
+
+def extract_s_hospital_from_suffix(sparts):
+    """For 2025 S EAH records the hospital name is printed AFTER the quota in
+    the PDF. Extract it from sparts[3:] and reconstruct the proper name."""
+    tail = re.sub(r'^[\d,\s\*]+', '', ' '.join(sparts[3:])).strip()
+    m = _HOSP_FROM_SUFFIX.search(tail)
+    if m:
+        # e.g. group(1)='Hastanesi', group(2)='Bağcılar Eğitim ve Araştırma'
+        return (m.group(2).strip() + ' ' + m.group(1).strip()).strip()
+    return ''
+
+
 def extract_hospital_key(sinif, tur, kurum_full):
     """Normalised name used as comparison key.
 
-    For T ÜNİ / YBU / SBA: university name is reliably in the prefix of both
-    PDFs → use it for hospital-level matching.
-    For S type: the 2025 PDF prints the hospital name AFTER the quota columns
-    (different column order), so it is garbled/incomplete → city-level only.
+    T ÜNİ / YBU / SBA: university name is reliably in the prefix of both PDFs.
+    S EAH: hospital short name (stripped of ministry/university affiliation).
+           For 2026 this comes from the clean prefix; for 2025 it comes from
+           the suffix-extracted name stored in kf by parse_2025_line.
+    All other types: city-level fallback (empty key).
     """
     s = kurum_full.strip()
     if tur in ('ÜNİ', 'YBU', 'SBA'):
-        # Strip trailing "Tıp Fakültesi" for a stable key
         s = re.sub(r'\s+Tıp\s+Fakültesi\s*$', '', s, flags=re.I).strip()
         return s.upper()
-    return ''   # city-level fallback for S EAH and other types
+    if tur == 'EAH' and s:
+        # Strip ministry prefix and university affiliation, keep hospital core
+        s = re.sub(r'^T\.C\.\s+Sağlık\s+Bakanlığı\s+', '', s, flags=re.I)
+        for marker in ['Sağlık Bilimleri Üniversitesi', 'Ankara Yıldırım']:
+            p = s.find(marker)
+            if p > 2:
+                s = s[:p]
+                break
+            elif p == 0:
+                # kf is purely university affiliation (hospital extraction failed)
+                return ''
+        m = re.search(r'\s+\S+\s+Üniversitesi', s)
+        if m and m.start() > 3:
+            s = s[:m.start()]
+        result = s.strip().upper()
+        return result if len(result) > 4 else ''   # discard garbage short keys
+    return ''   # city-level fallback for MAP, MSB, KKTC, etc.
 
 
 def make_key(sinif, tur, il, hospital_key, uzmanlik):
@@ -104,6 +134,11 @@ def extract_hospital_short(kurum_full, tur=''):
     if m and m.start() > 3:
         s = s[:m.start()]
     s = s.strip()
+    # If result is too short the kf was a university affiliation with no hospital name.
+    # Derive a compact label from the university name instead.
+    if len(s) < 8 and 'Sağlık Bilimleri Üniversitesi' in kurum_full:
+        s = re.sub(r'^.*?Sağlık Bilimleri Üniversitesi\s+', 'SBÜ ', kurum_full, flags=re.I)
+        s = re.sub(r'\s+Tıp\s+Fakültesi.*$', '', s, flags=re.I).strip()
     return s if s else (kurum_full[:60] if len(kurum_full) > 60 else kurum_full)
 
 
@@ -240,16 +275,19 @@ def parse_2025_line(line):
     total = genel + ybu
 
     pprts = prefix.split()
-    # For MAP the city is right after TÜR (no kurum in prefix)
     if tur == 'MAP':
-        il  = pprts[2] if len(pprts) > 2 else ''
-        kf  = ''
-    elif pparts[1] in ('MSB',):
-        il  = pprts[2] if len(pprts) > 2 else ''
-        kf  = ' '.join(pprts[3:])
+        il = pprts[2] if len(pprts) > 2 else ''
+        kf = ''
     else:
-        il  = pprts[2] if len(pprts) > 2 else ''
-        kf  = ' '.join(pprts[3:])
+        il = pprts[2] if len(pprts) > 2 else ''
+        kf = ' '.join(pprts[3:])
+
+    # For S EAH the hospital name is in the suffix (PDF column order differs).
+    # Try to extract it; on success replace kf with the proper hospital name.
+    if sinif == 'S' and tur == 'EAH':
+        extracted = extract_s_hospital_from_suffix(sparts)
+        if extracted:
+            kf = extracted
 
     hkey = extract_hospital_key(sinif, tur, kf)
     k    = extract_hospital_short(kf, tur) if kf else ''
@@ -271,31 +309,35 @@ def parse_2025(path):
 # ── Comparison ───────────────────────────────────────────────────────────────
 
 def enrich_with_comparison(records_26, records_25):
-    """Add p (previous quota) field to each 2026 record.
+    """Add p and pc fields to each 2026 record.
 
-    Only assigns p when the match is unambiguous: exactly one 2025 record and
-    exactly one 2026 record share the same key.  City-level keys (S EAH) can
-    match many-to-many, which would produce incorrect fan-out values.
+    p  = previous quota (only set for unambiguous 1-to-1 matches).
+    pc = city-level aggregate (set when multiple hospitals share a key so we
+         can't do individual matching, but the city DID have quota in 2025).
+         Displayed as '~' in the UI so the user knows data existed.
     """
     lookup_n   = {}   # key → summed 2025 quota
-    lookup_cnt = {}   # key → number of 2025 records with that key
+    lookup_cnt = {}   # key → number of 2025 records
     for r in records_25:
         k = r['ckey']
         lookup_n[k]   = lookup_n.get(k, 0) + r['n']
         lookup_cnt[k] = lookup_cnt.get(k, 0) + 1
 
-    cnt_26 = {}       # key → number of 2026 records with that key
+    cnt_26 = {}
     for r in records_26:
         cnt_26[r['ckey']] = cnt_26.get(r['ckey'], 0) + 1
 
     for r in records_26:
         k = r['ckey']
         if k not in lookup_n:
-            r['p'] = None   # new in 2026/1
+            r['p']  = None   # genuinely new in 2026/1
+            r['pc'] = None
         elif cnt_26[k] == 1 and lookup_cnt.get(k, 0) == 1:
-            r['p'] = lookup_n[k]   # unambiguous 1-to-1 match
+            r['p']  = lookup_n[k]   # clean 1-to-1 match
+            r['pc'] = None
         else:
-            r['p'] = None   # ambiguous city-level fan-out — don't show wrong data
+            r['p']  = None
+            r['pc'] = lookup_n[k]   # ambiguous — store city total for context
 
 
 # ── HTML generator ───────────────────────────────────────────────────────────
@@ -877,10 +919,10 @@ function render26(){{
     return `<td>${{badgeS(r.s)}}</td><td>${{badgeTur(r.t)}}</td><td><strong>${{r.i}}</strong></td>
       ${{kurumCell(r)}}<td class="uzmanlik-cell">${{r.u}}</td>
       <td class="quota">${{r.n}}<span class="qbar"><span class="qbar-fill" style="width:${{bw}}px;display:inline-block"></span></span></td>
-      <td class="quota" style="color:var(--accent)">${{r.p!=null?r.p:'<span class="tag-new">YENİ</span>'}}</td>
+      <td class="quota" style="color:var(--accent)">${{r.p!=null?r.p:(r.pc!=null?`<span title="2025/2 şehir toplamı: ${{r.pc}}" style="color:var(--muted);cursor:help">~${{r.pc}}</span>`:'<span class="tag-new">YENİ</span>')}}</td>
       ${{diffHtml}}`;
   }};
-  const rc=r=>r.p==null?'row-new':(r.n>r.p?'row-up':r.n<r.p?'row-dn':'');
+  const rc=r=>r.p==null?(r.pc!=null?'':'row-new'):(r.n>r.p?'row-up':r.n<r.p?'row-dn':'');
   renderTable({{data:f26,tbodyId:'tb26',ndId:'nd26',piId:'pi26',pbId:'pb26',tiId:'ti26',
     page:pg26,maxN:MAX_N26,cols,rowClass:rc}});
   // Wire up pagination clicks
@@ -998,7 +1040,8 @@ function initTabCmp(){{
 
 function changeType(r){{
   if(r.n===0&&r.p>0) return 'rm';
-  if(r.p==null)       return 'new';
+  if(r.p==null&&r.pc==null) return 'new';
+  if(r.p==null) return 'same'; // pc exists – hospital existed, matching ambiguous
   const d=r.n-r.p;
   if(d>0) return 'up'; if(d<0) return 'dn'; return 'same';
 }}
@@ -1096,7 +1139,10 @@ function renderCmp(){{
     const ct=changeType(r);
     const diff=r.p!=null?r.n-r.p:null;
     const pct=r.p>0?(r.n-r.p)/r.p*100:null;
-    const prevHtml=r.p!=null?`<span class="quota" style="color:var(--accent)">${{r.p}}</span>`:'<span class="tag-new">YENİ</span>';
+    const prevHtml=r.p!=null
+      ?`<span class="quota" style="color:var(--accent)">${{r.p}}</span>`
+      :(r.pc!=null?`<span title="2025/2 şehir toplamı: ${{r.pc}}" style="color:var(--muted);cursor:help">~${{r.pc}}</span>`
+      :'<span class="tag-new">YENİ</span>');
     const currHtml=r.n>0?`<span class="quota">${{r.n}}</span>`:`<span class="tag-rm">KALDIRILDI</span>`;
     const diffHtml=diff!=null
       ?`<span class="diff-cell ${{diff>0?'diff-pos':diff<0?'diff-neg':'diff-zero'}}">${{diff>0?'+':''}}${{diff}}</span>`
